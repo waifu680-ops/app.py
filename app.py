@@ -12,23 +12,25 @@ def decompile_rpyc():
         return jsonify({"error": "Dosya verisi bulunamadı."}), 400
 
     try:
-        # WordPress'ten gelen Base64 şifreli dosyayı çöz ve kaydet
         file_data = base64.b64decode(data['filedata'])
         filename = data.get('filename', 'temp.rpyc')
         
         with open(filename, 'wb') as f:
             f.write(file_data)
             
-        # unrpyc aracını çalıştırarak .rpyc dosyasını .rpy formatına çevir
-        subprocess.run(['python', 'unrpyc.py', filename], check=True)
+        # DİKKAT: Artık hatayı gizlemiyoruz, 'capture_output=True' ile yakalıyoruz!
+        result = subprocess.run(['python', 'unrpyc.py', filename], capture_output=True, text=True)
+        
+        # Eğer unrpyc hata verirse (status 1), gerçek hatayı WordPress'e gönder
+        if result.returncode != 0:
+            if os.path.exists(filename): os.remove(filename)
+            return jsonify({"error": f"unrpyc Detaylı Hata:\n{result.stderr}"}), 500
         
         rpy_filename = filename.replace('.rpyc', '.rpy')
         
-        # Çevrilen .rpy dosyasını oku
         with open(rpy_filename, 'r', encoding='utf-8') as f:
             rpy_content = f.read()
             
-        # Sunucuda yer kaplamaması için geçici dosyaları sil
         if os.path.exists(filename): os.remove(filename)
         if os.path.exists(rpy_filename): os.remove(rpy_filename)
         
