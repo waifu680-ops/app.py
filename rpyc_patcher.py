@@ -1,13 +1,35 @@
 import struct
 import zlib
 import pickle
+import sys
 from decompiler import magic, renpycompat
 
-def patch_ast(obj, translations):
-    """AST ağacını derinlemesine tarar ve çevirileri orijinal objelere enjekte eder."""
+# Ren'Py oyun dosyaları binlerce satır (düğüm) uzunluğunda olabilir.
+# Python'un varsayılan 1000 olan derinlik sınırını artırıyoruz.
+sys.setrecursionlimit(50000)
+
+def patch_ast(obj, translations, visited=None):
+    """AST ağacını derinlemesine tarar, döngüleri (loop) engeller ve çevirileri enjekte eder."""
+    if visited is None:
+        visited = set()
+        
+    # Basit veri tiplerini atla (İşlemi hızlandırır ve gereksiz taramayı önler)
+    if obj is None or isinstance(obj, (int, float, str, bool, bytes)):
+        return
+
+    # Döngüsel referansları (Infinite Loop) önlemek için objenin kimliğini kaydet
+    obj_id = id(obj)
+    if obj_id in visited:
+        return
+    visited.add(obj_id)
+
     if isinstance(obj, list) or isinstance(obj, tuple):
         for item in obj:
-            patch_ast(item, translations)
+            patch_ast(item, translations, visited)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            patch_ast(k, translations, visited)
+            patch_ast(v, translations, visited)
     elif hasattr(obj, '__dict__'):
         class_name = type(obj).__name__
         
@@ -32,7 +54,7 @@ def patch_ast(obj, translations):
             
         # Alt objeleri taramaya devam et
         for k, v in obj.__dict__.items():
-            patch_ast(v, translations)
+            patch_ast(v, translations, visited)
 
 def process_rpyc_file(file_bytes, translations):
     """Orijinal RPYC dosyasını açar, yamalar ve boyut kaymalarını hesaplayarak geri paketler."""
@@ -66,7 +88,6 @@ def process_rpyc_file(file_bytes, translations):
         new_zlib = zlib.compress(new_pickle)
         
         # 6. YENİ RPYC DOSYASINI İNŞA ET
-        # Yeni Türkçe metinler daha uzun/kısa olabileceği için ofset (başlangıç) noktalarını kaydırmalıyız
         new_file = bytearray(file_bytes[:position]) # Başlık ve orijinal harita (0 bitişi dahil)
         current_offset = position
         
