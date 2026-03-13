@@ -4,7 +4,6 @@ import pickle
 import sys
 from decompiler import magic, renpycompat
 
-# Ren'Py motorunun derinlikleri için sınırı artırıyoruz
 sys.setrecursionlimit(50000)
 
 def unescape_wp_string(s):
@@ -17,7 +16,7 @@ def unescape_wp_string(s):
     return s.replace('\r', '')
 
 def apply_translation(text, translations):
-    """Sadece eşleşen kelime/cümle öbeklerini değiştirir, kodu bozmaz."""
+    """Sadece eşleşen kelime/cümle öbeklerini değiştirir, veri tipini (Protocol 2) korur."""
     if not isinstance(text, (str, bytes)): return text
     is_bytes = isinstance(text, bytes)
     text_str = text.decode('utf-8', 'ignore') if is_bytes else text
@@ -28,11 +27,12 @@ def apply_translation(text, translations):
             text_str = text_str.replace(k, v)
             
     if text_str != original_text_str:
+        # Pickle Protocol 2 için orijinali bytes ise bytes, str ise str döndür
         return text_str.encode('utf-8') if is_bytes else text_str
     return text
 
 def patch_ast(obj, translations, visited=None):
-    """AST ağacını zincirleri (tuple) KIRMADAN tarayan Hayalet Enjektör."""
+    """AST ağacını zincirleri KIRMADAN tarayan motor (SLOT 1 İÇİN)."""
     if visited is None: visited = set()
     if obj is None or isinstance(obj, (int, float, bool, str, bytes)): return
     
@@ -40,21 +40,17 @@ def patch_ast(obj, translations, visited=None):
     if obj_id in visited: return
     visited.add(obj_id)
 
-    # 1. Liste veya Zincir (Tuple) ise içine gir ama yapısını BOZMA
     if isinstance(obj, (list, tuple)):
         for item in obj:
             patch_ast(item, translations, visited)
             
-    # 2. Sözlük ise değerlerin içine gir
     elif isinstance(obj, dict):
         for k, v in obj.items():
             patch_ast(v, translations, visited)
             
-    # 3. Asıl Hedef: Oyun Objeleri
     elif hasattr(obj, '__dict__'):
         class_name = type(obj).__name__
         
-        # Sadece diyalog ve menülere müdahale ediyoruz!
         if class_name == 'Say' and hasattr(obj, 'what'):
             obj.what = apply_translation(obj.what, translations)
             
@@ -69,16 +65,14 @@ def patch_ast(obj, translations, visited=None):
             obj.items = new_items
             
         elif class_name == 'TranslateString':
-            # Modern Ren'Py sürümlerinde çevirilerin tutulduğu yer
             if hasattr(obj, 'new'):
                 obj.new = apply_translation(obj.new, translations)
 
-        # Diğer özelliklerin içindeki alt objelere inmeye devam et
         for k, v in obj.__dict__.items():
             patch_ast(v, translations, visited)
 
 def process_rpyc_file(file_bytes, raw_translations):
-    """Dosya yapısını %100 koruyarak sadece AST'yi güncelleyen ana motor."""
+    """HER İKİ BLOĞU DA (Slot 1 ve Slot 2) Tıpkı SaveEditOnline gibi güncelleyen ana motor."""
     sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {}
     for k in sorted_keys:
@@ -97,29 +91,38 @@ def process_rpyc_file(file_bytes, raw_translations):
             if slot == 0: break
             chunks.append({"slot": slot, "start": start, "length": length})
             
-        slot1 = next((c for c in chunks if c["slot"] == 1), None)
-        if not slot1: raise ValueError("Geçerli bir kod bölümü (Slot 1) bulunamadı.")
-            
-        # Makine dilini çıkar ve yama yap
-        zlib_data = file_bytes[slot1["start"] : slot1["start"] + slot1["length"]]
-        raw_pickle = zlib.decompress(zlib_data)
-        ast_tree = renpycompat.pickle_loads(raw_pickle)
-        
-        patch_ast(ast_tree, clean_translations)
-        
-        new_pickle = pickle.dumps(ast_tree, protocol=2)
-        new_zlib = zlib.compress(new_pickle)
-        
-        # --- DOSYAYI %100 ORİJİNAL YAPIDA GERİ BİRLEŞTİR ---
         payloads = {}
+        
+        # --- İŞTE O SİHİRLİ DOKUNUŞ ---
         for c in chunks:
+            chunk_data = file_bytes[c["start"] : c["start"] + c["length"]]
+            
+            # SLOT 1: PICKLED AST (Makine Kodu) Yamalaması
             if c["slot"] == 1:
-                # Sadece Slot 1'i (bizim güncellediğimiz kısım) değiştir
-                payloads[c["slot"]] = new_zlib
-            else:
-                # Slot 2 (Kaynak kod) dahil tüm diğer parçaları olduğu gibi kopyala
-                payloads[c["slot"]] = file_bytes[c["start"] : c["start"] + c["length"]]
+                raw_pickle = zlib.decompress(chunk_data)
+                ast_tree = renpycompat.pickle_loads(raw_pickle)
+                patch_ast(ast_tree, clean_translations)
+                # Protokol 2 zorunlu (Geliştiricinin bahsettiği uyumluluk sırrı)
+                new_pickle = pickle.dumps(ast_tree, protocol=2) 
+                payloads[1] = zlib.compress(new_pickle)
                 
+            # SLOT 2: RAW SOURCE CODE (Orijinal Kod Metni) Yamalaması
+            elif c["slot"] == 2:
+                try:
+                    raw_source = zlib.decompress(chunk_data).decode('utf-8')
+                    # Slot 2'yi silmek yerine, içindeki İngilizce kelimeleri de Türkçe yapıyoruz!
+                    for k, v in clean_translations.items():
+                        raw_source = raw_source.replace(k, v)
+                    payloads[2] = zlib.compress(raw_source.encode('utf-8'))
+                except Exception:
+                    # Olası bir decode hatasında orijinali koru
+                    payloads[2] = chunk_data
+                    
+            # DİĞER SLOTLAR: Aynen koru
+            else:
+                payloads[c["slot"]] = chunk_data
+                
+        # --- DOSYAYI %100 ORİJİNAL YAPIDA GERİ BİRLEŞTİR ---
         new_dir = bytearray()
         current_offset = 10 + (len(chunks) + 1) * 12
         
@@ -142,5 +145,4 @@ def process_rpyc_file(file_bytes, raw_translations):
         raw_pickle = zlib.decompress(file_bytes)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         patch_ast(ast_tree, clean_translations)
-        new_pickle = pickle.dumps(ast_tree, protocol=2)
-        return zlib.compress(new_pickle)
+        return zlib.compress(pickle.dumps(ast_tree, protocol=2))
