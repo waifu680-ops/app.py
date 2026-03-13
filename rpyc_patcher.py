@@ -8,8 +8,18 @@ from decompiler import magic, renpycompat
 # Python'un varsayılan 1000 olan derinlik sınırını artırıyoruz.
 sys.setrecursionlimit(50000)
 
+def unescape_wp_string(s):
+    """WordPress'ten gelen stringlerdeki kaçış karakterlerini gerçek karakterlere çevirir."""
+    if not isinstance(s, str):
+        return s
+    s = s.replace('\\n', '\n')
+    s = s.replace('\\"', '"')
+    s = s.replace('\\ ', ' ')
+    s = s.replace('\\\\', '\\')
+    return s
+
 def patch_ast(obj, translations, visited=None):
-    """AST ağacını derinlemesine tarar, döngüleri (loop) engeller ve çevirileri enjekte eder."""
+    """AST ağacını derinlemesine tarar, döngüleri engeller ve ALT METİN (Substring) yöntemiyle çevirileri enjekte eder."""
     if visited is None:
         visited = set()
         
@@ -33,18 +43,37 @@ def patch_ast(obj, translations, visited=None):
     elif hasattr(obj, '__dict__'):
         class_name = type(obj).__name__
         
-        # Diyalog satırlarını bul ve değiştir
+        # 1. Diyalog satırlarını bul ve ALT METİN olarak değiştir
         if class_name == 'Say' and hasattr(obj, 'what'):
-            if obj.what in translations:
-                obj.what = translations[obj.what]
+            text = obj.what
+            # Ren'Py v7 (Py2) desteklemek için bytes/str kontrolü yapıyoruz
+            is_bytes = isinstance(text, bytes)
+            text_str = text.decode('utf-8') if is_bytes else text
+            
+            original_text_str = text_str
+            for k, v in translations.items():
+                if k in text_str:
+                    text_str = text_str.replace(k, v)
+                    
+            if text_str != original_text_str:
+                obj.what = text_str.encode('utf-8') if is_bytes else text_str
                 
-        # Menü seçimlerini bul ve değiştir
+        # 2. Menü (Seçim) Ekranlarını bul ve ALT METİN olarak değiştir
         elif class_name == 'Menu' and hasattr(obj, 'items'):
             new_items = []
             for item in obj.items:
                 label = item[0]
-                if label in translations:
-                    label = translations[label]
+                is_bytes = isinstance(label, bytes)
+                label_str = label.decode('utf-8') if is_bytes else label
+                
+                original_label_str = label_str
+                for k, v in translations.items():
+                    if k in label_str:
+                        label_str = label_str.replace(k, v)
+                        
+                if label_str != original_label_str:
+                    label = label_str.encode('utf-8') if is_bytes else label_str
+                    
                 # Menü öğeleri genelde 3 parçadan oluşur (Etiket, Şart, Blok)
                 if len(item) >= 3:
                     new_items.append((label, item[1], item[2]))
@@ -56,63 +85,66 @@ def patch_ast(obj, translations, visited=None):
         for k, v in obj.__dict__.items():
             patch_ast(v, translations, visited)
 
-def process_rpyc_file(file_bytes, translations):
+def process_rpyc_file(file_bytes, raw_translations):
     """Orijinal RPYC dosyasını açar, yamalar ve boyut kaymalarını hesaplayarak geri paketler."""
+    
+    # --- KRİTİK ADIM: Çevirileri Enjeksiyon İçin Kusursuz Hale Getir ---
+    # Çakışmaları önlemek için önce en uzun cümleleri (karakter sayısına göre) sıralıyoruz
+    sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
+    clean_translations = {}
+    for k in sorted_keys:
+        clean_k = unescape_wp_string(k)
+        if clean_k.strip(): # Boşluk veya hatalı kelimeleri yoksay
+            clean_translations[clean_k] = unescape_wp_string(raw_translations[k])
+
+    # --- RPYC DOSYASINI AÇ VE YAMALA ---
     if file_bytes.startswith(b"RENPY RPC2"):
         position = 10
         chunks = []
         
-        # 1. RPYC Dosyasının İkili (Binary) Haritasını Çıkar
         while True:
             slot, start, length = struct.unpack("III", file_bytes[position:position+12])
             position += 12
-            if slot == 0: # 0, haritanın bittiğini gösterir
+            if slot == 0:
                 break
             chunks.append({"slot": slot, "start": start, "length": length})
             
-        # 2. Asıl Oyun Kodlarının Bulunduğu "Slot 1"i Bul
         slot1 = next((c for c in chunks if c["slot"] == 1), None)
         if not slot1:
             raise ValueError("Geçerli bir kod bölümü (Slot 1) bulunamadı.")
             
-        # 3. Zlib'den Çıkar ve Belleğe (AST) Yükle
         zlib_data = file_bytes[slot1["start"] : slot1["start"] + slot1["length"]]
         raw_pickle = zlib.decompress(zlib_data)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         
-        # 4. Çevirileri Doğrudan Objelerin İçine Enjekte Et
-        patch_ast(ast_tree, translations)
+        # Temizlenmiş ve sıralanmış çevirileri AST içine enjekte et
+        patch_ast(ast_tree, clean_translations)
         
-        # 5. Orijinal Formatta (Protocol 2) Yeniden Şifrele ve Zlib ile Sıkıştır
         new_pickle = pickle.dumps(ast_tree, protocol=2)
         new_zlib = zlib.compress(new_pickle)
         
-        # 6. YENİ RPYC DOSYASINI İNŞA ET
-        new_file = bytearray(file_bytes[:position]) # Başlık ve orijinal harita (0 bitişi dahil)
+        new_file = bytearray(file_bytes[:position])
         current_offset = position
         
         for idx, chunk in enumerate(chunks):
             slot = chunk["slot"]
-            # Eğer Slot 1 ise kendi yamaladığımız veriyi, değilse orijinal veriyi koy
             if slot == 1:
                 data_to_write = new_zlib
             else:
                 data_to_write = file_bytes[chunk["start"] : chunk["start"] + chunk["length"]]
                 
-            # Dosya haritasındaki başlangıç ve uzunluk (offset/length) bilgilerini yeniden yaz
             dir_pos = 10 + (idx * 12)
             new_file[dir_pos : dir_pos+12] = struct.pack("III", slot, current_offset, len(data_to_write))
             
-            # Veriyi dosyaya ekle ve ofseti bir sonraki slot için kaydır
             new_file.extend(data_to_write)
             current_offset += len(data_to_write)
             
         return bytes(new_file)
         
     else:
-        # Eski V1 Formatındaki (.rpyc) Oyunlar İçin Alternatif
+        # Eski V1 Formatındaki (.rpyc) Oyunlar İçin
         raw_pickle = zlib.decompress(file_bytes)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
-        patch_ast(ast_tree, translations)
+        patch_ast(ast_tree, clean_translations)
         new_pickle = pickle.dumps(ast_tree, protocol=2)
         return zlib.compress(new_pickle)
