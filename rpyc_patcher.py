@@ -23,7 +23,11 @@ def patch_ast(obj, translations):
                 label = item[0]
                 if label in translations:
                     label = translations[label]
-                new_items.append((label, item[1], item[2]))
+                # item genelde 3 öğelidir: (label, condition, block)
+                if len(item) >= 3:
+                    new_items.append((label, item[1], item[2]))
+                else:
+                    new_items.append((label,) + item[1:])
             obj.items = new_items
             
         # Alt objeleri taramaya devam et
@@ -32,16 +36,18 @@ def patch_ast(obj, translations):
 
 def process_rpyc_file(file_bytes, translations):
     """Orijinal RPYC dosyasını açar, yamalar ve bozulmadan geri paketler."""
-    if file_bytes.startswith(b"RENPY RPC2 SAVE FILE COLUMN FORMAT\n"):
-        # RPC2 başlığını atla
-        pos = file_bytes.find(b"\n", 35) + 1
+    header = b"RENPY RPC2 SAVE FILE COLUMN FORMAT\n"
+    
+    if file_bytes.startswith(header):
+        # DÜZELTME: Zlib akışı tam olarak header'ın bittiği 35. karakterde başlar!
+        pos = len(header)
         
         # Zlib ile sıkıştırılmış JSON Slot Haritasını oku
         decomp = zlib.decompressobj()
         slot_json_bytes = decomp.decompress(file_bytes[pos:])
         slot_map = json.loads(slot_json_bytes.decode('utf-8'))
         
-        # Slot verisinin başladığı yeri bul
+        # Slot verisinin başladığı yeri bul (zlib stream'den geriye kalan veriler)
         slot_data_start = len(file_bytes) - len(decomp.unused_data)
         
         if 'script' not in slot_map:
@@ -61,16 +67,22 @@ def process_rpyc_file(file_bytes, translations):
         new_pickle = pickle.dumps(ast_tree, protocol=2)
         new_zlib = zlib.compress(new_pickle)
         
-        # Yeni dosya uzunluklarına göre Slot Haritasını güncelle
-        slot_map['script'] = [0, len(new_zlib)]
+        # Uzunluk farkını hesapla ve sonrasındaki slotları kaydır (Dosyanın bozulmaması için çok önemli)
+        length_diff = len(new_zlib) - length
+        for k, v in slot_map.items():
+            if v[0] > offset: # Offset'i script'ten büyük olan slotlar yer değiştirir
+                v[0] += length_diff
+                
+        slot_map['script'] = [offset, len(new_zlib)]
         new_slot_json = json.dumps(slot_map).encode('utf-8')
         new_slot_zlib = zlib.compress(new_slot_json)
         
-        # Orijinal RPYC formatını sıfırdan inşa et
-        header = b"RENPY RPC2 SAVE FILE COLUMN FORMAT\n"
-        return header + new_slot_zlib + new_zlib
+        # Yeni RPYC dosyasını kusursuz şekilde birleştir
+        new_slot_data = file_bytes[slot_data_start : slot_data_start + offset] + new_zlib + file_bytes[slot_data_start + offset + length :]
+        
+        return header + new_slot_zlib + new_slot_data
     else:
-        # Eski V1 Formatı (Sadece zlib datası)
+        # Eski V1 Formatı (Nadir görülen bir versiyon için destek)
         raw_pickle = zlib.decompress(file_bytes)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         patch_ast(ast_tree, translations)
