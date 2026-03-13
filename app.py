@@ -3,8 +3,16 @@ import base64
 import os
 import subprocess
 
+# --- YENİ EKLENEN KÜTÜPHANE ---
+# RPYC yamalama motorumuzu içeri aktarıyoruz
+from rpyc_patcher import process_rpyc_file
+# ------------------------------
+
 app = Flask(__name__)
 
+# ==========================================
+# 1. MEVCUT ÖZELLİĞİN (HİÇ DOKUNULMADI)
+# ==========================================
 @app.route('/decompile', methods=['POST'])
 def decompile_rpyc():
     data = request.json
@@ -38,6 +46,35 @@ def decompile_rpyc():
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ==========================================
+# 2. YENİ ÖZELLİĞİMİZ: RPYC ENJEKTÖRÜ
+# ==========================================
+@app.route('/patch', methods=['POST'])
+def patch_endpoint():
+    try:
+        data = request.get_json()
+        
+        if not data or 'filedata' not in data or 'translations' not in data:
+            return jsonify({"error": "Eksik veri gönderildi."}), 400
+
+        # WordPress'ten gelen base64 formatlı orijinal dosyayı çöz
+        original_rpyc_bytes = base64.b64decode(data['filedata'])
+        translations_dict = data['translations'] # JSON çeviri sözlüğü
+        
+        # Dosyayı yeni motorumuzla RAM üzerinde patch'le!
+        patched_rpyc_bytes = process_rpyc_file(original_rpyc_bytes, translations_dict)
+        
+        # Orijinal RPYC formatını WordPress'e tekrar base64 olarak gönder
+        return jsonify({
+            'success': True,
+            'patched_file': base64.b64encode(patched_rpyc_bytes).decode('utf-8')
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==========================================
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
