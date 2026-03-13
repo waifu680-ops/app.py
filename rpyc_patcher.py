@@ -4,11 +4,11 @@ import pickle
 import sys
 from decompiler import magic, renpycompat
 
-# Ren'Py motorunun binlerce satırlık derinliğine inebilmek için sınırı artırıyoruz
+# Ren'Py motorunun derinlikleri için sınırı artırıyoruz
 sys.setrecursionlimit(50000)
 
 def unescape_wp_string(s):
-    """WordPress'ten gelen metinleri Python makine dili formatına kusursuz uydurur."""
+    """WordPress'ten gelen metinleri Python formatına uydurur."""
     if not isinstance(s, str): return s
     s = s.replace('\\n', '\n')
     s = s.replace('\\"', '"')
@@ -17,7 +17,7 @@ def unescape_wp_string(s):
     return s.replace('\r', '')
 
 def apply_translation(text, translations):
-    """Sadece verilen metin içinde geçen alt-cümleleri güvenli bir şekilde değiştirir."""
+    """Sadece eşleşen kelime/cümle öbeklerini değiştirir, kodu bozmaz."""
     if not isinstance(text, (str, bytes)): return text
     is_bytes = isinstance(text, bytes)
     text_str = text.decode('utf-8', 'ignore') if is_bytes else text
@@ -32,41 +32,32 @@ def apply_translation(text, translations):
     return text
 
 def patch_ast(obj, translations, visited=None):
-    """AST ağacını güvenli bir şekilde tarar. YALNIZCA diyaloglara müdahale eder, kodu asla bozmaz."""
+    """AST ağacını zincirleri (tuple) KIRMADAN tarayan Hayalet Enjektör."""
     if visited is None: visited = set()
-    if obj is None or isinstance(obj, (int, float, bool, str, bytes)): return obj
+    if obj is None or isinstance(obj, (int, float, bool, str, bytes)): return
     
     obj_id = id(obj)
-    if obj_id in visited: return obj
+    if obj_id in visited: return
     visited.add(obj_id)
 
-    if isinstance(obj, list):
-        for i in range(len(obj)):
-            obj[i] = patch_ast(obj[i], translations, visited)
-        return obj
-    elif isinstance(obj, tuple):
-        # Tuple içindeki veriler değiştiyse yeni bir tuple inşa et
-        new_tuple = []
-        changed = False
+    # 1. Liste veya Zincir (Tuple) ise içine gir ama yapısını BOZMA
+    if isinstance(obj, (list, tuple)):
         for item in obj:
-            new_item = patch_ast(item, translations, visited)
-            new_tuple.append(new_item)
-            if new_item is not item: changed = True
-        return tuple(new_tuple) if changed else obj
+            patch_ast(item, translations, visited)
+            
+    # 2. Sözlük ise değerlerin içine gir
     elif isinstance(obj, dict):
-        for k, v in list(obj.items()):
-            obj[k] = patch_ast(v, translations, visited)
-        return obj
+        for k, v in obj.items():
+            patch_ast(v, translations, visited)
+            
+    # 3. Asıl Hedef: Oyun Objeleri
     elif hasattr(obj, '__dict__'):
         class_name = type(obj).__name__
         
-        # SADECE VE SADECE DİYALOG VE METİN SINIFLARINA DOKUN! (Oyunun çökmemesi için en hayati kısım)
-        
-        # 1. Normal Diyaloglar
+        # Sadece diyalog ve menülere müdahale ediyoruz!
         if class_name == 'Say' and hasattr(obj, 'what'):
             obj.what = apply_translation(obj.what, translations)
             
-        # 2. Seçim Menüleri
         elif class_name == 'Menu' and hasattr(obj, 'items'):
             new_items = []
             for item in obj.items:
@@ -77,26 +68,17 @@ def patch_ast(obj, translations, visited=None):
                     new_items.append((label,) + item[1:])
             obj.items = new_items
             
-        # 3. Çeviri Belleği (Modern Ren'Py oyunlarında yazıların tutulduğu asıl yer)
         elif class_name == 'TranslateString':
+            # Modern Ren'Py sürümlerinde çevirilerin tutulduğu yer
             if hasattr(obj, 'new'):
                 obj.new = apply_translation(obj.new, translations)
-            if hasattr(obj, 'old'):
-                obj.old = apply_translation(obj.old, translations)
 
-        # Alt düğümlere inmeye devam et ama onlara rastgele string işlemi UYGULAMA!
+        # Diğer özelliklerin içindeki alt objelere inmeye devam et
         for k, v in obj.__dict__.items():
-            new_v = patch_ast(v, translations, visited)
-            if new_v is not v:
-                obj.__dict__[k] = new_v
-                
-        return obj
-    return obj
+            patch_ast(v, translations, visited)
 
 def process_rpyc_file(file_bytes, raw_translations):
-    """Orijinal RPYC dosyasını açar, içini güvenli bir şekilde Türkçeleştirir ve paketler."""
-    
-    # Kelime çakışmalarını önlemek için en uzun cümlen en kısaya göre sırala
+    """Dosya yapısını %100 koruyarak sadece AST'yi güncelleyen ana motor."""
     sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {}
     for k in sorted_keys:
@@ -108,36 +90,34 @@ def process_rpyc_file(file_bytes, raw_translations):
         position = 10
         chunks = []
         
+        # Orijinal haritayı çıkar
         while True:
             slot, start, length = struct.unpack("III", file_bytes[position:position+12])
             position += 12
-            if slot == 0:
-                break
+            if slot == 0: break
             chunks.append({"slot": slot, "start": start, "length": length})
             
         slot1 = next((c for c in chunks if c["slot"] == 1), None)
-        if not slot1:
-            raise ValueError("Geçerli bir kod bölümü (Slot 1) bulunamadı.")
+        if not slot1: raise ValueError("Geçerli bir kod bölümü (Slot 1) bulunamadı.")
             
+        # Makine dilini çıkar ve yama yap
         zlib_data = file_bytes[slot1["start"] : slot1["start"] + slot1["length"]]
         raw_pickle = zlib.decompress(zlib_data)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         
-        # Güvenli Yamalama İşlemi
         patch_ast(ast_tree, clean_translations)
         
         new_pickle = pickle.dumps(ast_tree, protocol=2)
         new_zlib = zlib.compress(new_pickle)
         
-        # --- KUSURSUZ YENİDEN İNŞA (REPACKING) ---
+        # --- DOSYAYI %100 ORİJİNAL YAPIDA GERİ BİRLEŞTİR ---
         payloads = {}
         for c in chunks:
             if c["slot"] == 1:
-                payloads[1] = new_zlib
-            elif c["slot"] == 2:
-                # Slot 2'yi SİLMİYORUZ, sadece içini (İngilizce kodu) güvenli bir şekilde SIFIRLIYORUZ!
-                payloads[2] = zlib.compress(b"")
+                # Sadece Slot 1'i (bizim güncellediğimiz kısım) değiştir
+                payloads[c["slot"]] = new_zlib
             else:
+                # Slot 2 (Kaynak kod) dahil tüm diğer parçaları olduğu gibi kopyala
                 payloads[c["slot"]] = file_bytes[c["start"] : c["start"] + c["length"]]
                 
         new_dir = bytearray()
@@ -158,7 +138,7 @@ def process_rpyc_file(file_bytes, raw_translations):
         return bytes(new_file)
         
     else:
-        # Eski V1 Formatındaki Oyunlar İçin
+        # Eski V1 Formatı
         raw_pickle = zlib.decompress(file_bytes)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         patch_ast(ast_tree, clean_translations)
