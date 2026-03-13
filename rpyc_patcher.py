@@ -1,4 +1,4 @@
-import json
+import struct
 import zlib
 import pickle
 from decompiler import magic, renpycompat
@@ -23,7 +23,7 @@ def patch_ast(obj, translations):
                 label = item[0]
                 if label in translations:
                     label = translations[label]
-                # item genelde 3 öğelidir: (label, condition, block)
+                # Menü öğeleri genelde 3 parçadan oluşur (Etiket, Şart, Blok)
                 if len(item) >= 3:
                     new_items.append((label, item[1], item[2]))
                 else:
@@ -35,55 +35,63 @@ def patch_ast(obj, translations):
             patch_ast(v, translations)
 
 def process_rpyc_file(file_bytes, translations):
-    """Orijinal RPYC dosyasını açar, yamalar ve bozulmadan geri paketler."""
-    header = b"RENPY RPC2 SAVE FILE COLUMN FORMAT\n"
-    
-    if file_bytes.startswith(header):
-        # DÜZELTME: Zlib akışı tam olarak header'ın bittiği 35. karakterde başlar!
-        pos = len(header)
+    """Orijinal RPYC dosyasını açar, yamalar ve boyut kaymalarını hesaplayarak geri paketler."""
+    if file_bytes.startswith(b"RENPY RPC2"):
+        position = 10
+        chunks = []
         
-        # Zlib ile sıkıştırılmış JSON Slot Haritasını oku
-        decomp = zlib.decompressobj()
-        slot_json_bytes = decomp.decompress(file_bytes[pos:])
-        slot_map = json.loads(slot_json_bytes.decode('utf-8'))
-        
-        # Slot verisinin başladığı yeri bul (zlib stream'den geriye kalan veriler)
-        slot_data_start = len(file_bytes) - len(decomp.unused_data)
-        
-        if 'script' not in slot_map:
-            return file_bytes # Geçerli bir script slotu yoksa orijinali döndür
-        
-        offset, length = slot_map['script']
-        zlib_data = file_bytes[slot_data_start + offset : slot_data_start + offset + length]
-        
-        # Makine dilini (AST) belleğe yükle
+        # 1. RPYC Dosyasının İkili (Binary) Haritasını Çıkar
+        while True:
+            slot, start, length = struct.unpack("III", file_bytes[position:position+12])
+            position += 12
+            if slot == 0: # 0, haritanın bittiğini gösterir
+                break
+            chunks.append({"slot": slot, "start": start, "length": length})
+            
+        # 2. Asıl Oyun Kodlarının Bulunduğu "Slot 1"i Bul
+        slot1 = next((c for c in chunks if c["slot"] == 1), None)
+        if not slot1:
+            raise ValueError("Geçerli bir kod bölümü (Slot 1) bulunamadı.")
+            
+        # 3. Zlib'den Çıkar ve Belleğe (AST) Yükle
+        zlib_data = file_bytes[slot1["start"] : slot1["start"] + slot1["length"]]
         raw_pickle = zlib.decompress(zlib_data)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         
-        # Çevirileri Enjekte Et
+        # 4. Çevirileri Doğrudan Objelerin İçine Enjekte Et
         patch_ast(ast_tree, translations)
         
-        # Yeniden Şifrele ve Sıkıştır (Zorunlu Protocol 2)
+        # 5. Orijinal Formatta (Protocol 2) Yeniden Şifrele ve Zlib ile Sıkıştır
         new_pickle = pickle.dumps(ast_tree, protocol=2)
         new_zlib = zlib.compress(new_pickle)
         
-        # Uzunluk farkını hesapla ve sonrasındaki slotları kaydır (Dosyanın bozulmaması için çok önemli)
-        length_diff = len(new_zlib) - length
-        for k, v in slot_map.items():
-            if v[0] > offset: # Offset'i script'ten büyük olan slotlar yer değiştirir
-                v[0] += length_diff
+        # 6. YENİ RPYC DOSYASINI İNŞA ET
+        # Yeni Türkçe metinler daha uzun/kısa olabileceği için ofset (başlangıç) noktalarını kaydırmalıyız
+        new_file = bytearray(file_bytes[:position]) # Başlık ve orijinal harita (0 bitişi dahil)
+        current_offset = position
+        
+        for idx, chunk in enumerate(chunks):
+            slot = chunk["slot"]
+            # Eğer Slot 1 ise kendi yamaladığımız veriyi, değilse orijinal veriyi koy
+            if slot == 1:
+                data_to_write = new_zlib
+            else:
+                data_to_write = file_bytes[chunk["start"] : chunk["start"] + chunk["length"]]
                 
-        slot_map['script'] = [offset, len(new_zlib)]
-        new_slot_json = json.dumps(slot_map).encode('utf-8')
-        new_slot_zlib = zlib.compress(new_slot_json)
+            # Dosya haritasındaki başlangıç ve uzunluk (offset/length) bilgilerini yeniden yaz
+            dir_pos = 10 + (idx * 12)
+            new_file[dir_pos : dir_pos+12] = struct.pack("III", slot, current_offset, len(data_to_write))
+            
+            # Veriyi dosyaya ekle ve ofseti bir sonraki slot için kaydır
+            new_file.extend(data_to_write)
+            current_offset += len(data_to_write)
+            
+        return bytes(new_file)
         
-        # Yeni RPYC dosyasını kusursuz şekilde birleştir
-        new_slot_data = file_bytes[slot_data_start : slot_data_start + offset] + new_zlib + file_bytes[slot_data_start + offset + length :]
-        
-        return header + new_slot_zlib + new_slot_data
     else:
-        # Eski V1 Formatı (Nadir görülen bir versiyon için destek)
+        # Eski V1 Formatındaki (.rpyc) Oyunlar İçin Alternatif
         raw_pickle = zlib.decompress(file_bytes)
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         patch_ast(ast_tree, translations)
-        return zlib.compress(pickle.dumps(ast_tree, protocol=2))
+        new_pickle = pickle.dumps(ast_tree, protocol=2)
+        return zlib.compress(new_pickle)
