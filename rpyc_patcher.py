@@ -4,6 +4,7 @@ import pickle
 import sys
 from decompiler import magic, renpycompat
 
+# Ren'Py motorunun derinlikleri için sınırı artırıyoruz
 sys.setrecursionlimit(50000)
 
 def unescape_wp_string(s):
@@ -16,7 +17,7 @@ def unescape_wp_string(s):
     return s.replace('\r', '')
 
 def apply_translation(text, translations):
-    """Sadece eşleşen kelime/cümle öbeklerini değiştirir, veri tipini (Protocol 2) korur."""
+    """Sadece eşleşen kelime/cümle öbeklerini değiştirir, veri tipini korur."""
     if not isinstance(text, (str, bytes)): return text
     is_bytes = isinstance(text, bytes)
     text_str = text.decode('utf-8', 'ignore') if is_bytes else text
@@ -27,12 +28,11 @@ def apply_translation(text, translations):
             text_str = text_str.replace(k, v)
             
     if text_str != original_text_str:
-        # Pickle Protocol 2 için orijinali bytes ise bytes, str ise str döndür
         return text_str.encode('utf-8') if is_bytes else text_str
     return text
 
 def patch_ast(obj, translations, visited=None):
-    """AST ağacını zincirleri KIRMADAN tarayan motor (SLOT 1 İÇİN)."""
+    """AST ağacını zincirleri KIRMADAN tarayan motor."""
     if visited is None: visited = set()
     if obj is None or isinstance(obj, (int, float, bool, str, bytes)): return
     
@@ -72,7 +72,7 @@ def patch_ast(obj, translations, visited=None):
             patch_ast(v, translations, visited)
 
 def process_rpyc_file(file_bytes, raw_translations):
-    """HER İKİ BLOĞU DA (Slot 1 ve Slot 2) Tıpkı SaveEditOnline gibi güncelleyen ana motor."""
+    """Hem Slot 1'i hem Slot 2'yi yamalayan ve Orijinal Protokolü koruyan Nihai Motor."""
     sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {}
     for k in sorted_keys:
@@ -84,7 +84,6 @@ def process_rpyc_file(file_bytes, raw_translations):
         position = 10
         chunks = []
         
-        # Orijinal haritayı çıkar
         while True:
             slot, start, length = struct.unpack("III", file_bytes[position:position+12])
             position += 12
@@ -93,36 +92,38 @@ def process_rpyc_file(file_bytes, raw_translations):
             
         payloads = {}
         
-        # --- İŞTE O SİHİRLİ DOKUNUŞ ---
         for c in chunks:
             chunk_data = file_bytes[c["start"] : c["start"] + c["length"]]
             
-            # SLOT 1: PICKLED AST (Makine Kodu) Yamalaması
             if c["slot"] == 1:
                 raw_pickle = zlib.decompress(chunk_data)
+                
+                # --- İŞTE O İPUCU: PROTOKOLÜ DİNAMİK OLARAK TESPİT ET ---
+                orig_proto = 2
+                # Pickle dosyaları \x80 byte'ı ile başlar ve hemen ardından protokol sürümü (2,3,4,5) gelir.
+                if len(raw_pickle) >= 2 and raw_pickle[0] == 0x80:
+                    orig_proto = raw_pickle[1]
+                    
                 ast_tree = renpycompat.pickle_loads(raw_pickle)
                 patch_ast(ast_tree, clean_translations)
-                # Protokol 2 zorunlu (Geliştiricinin bahsettiği uyumluluk sırrı)
-                new_pickle = pickle.dumps(ast_tree, protocol=2) 
+                
+                # Oyunun kendi orijinal protokolüyle tekrar paketle!
+                new_pickle = pickle.dumps(ast_tree, protocol=orig_proto) 
                 payloads[1] = zlib.compress(new_pickle)
                 
-            # SLOT 2: RAW SOURCE CODE (Orijinal Kod Metni) Yamalaması
             elif c["slot"] == 2:
+                # İkinci ipucu: Orijinal kaynak kod (Slot 2) metinlerini de Türkçeleştir!
                 try:
                     raw_source = zlib.decompress(chunk_data).decode('utf-8')
-                    # Slot 2'yi silmek yerine, içindeki İngilizce kelimeleri de Türkçe yapıyoruz!
                     for k, v in clean_translations.items():
                         raw_source = raw_source.replace(k, v)
                     payloads[2] = zlib.compress(raw_source.encode('utf-8'))
                 except Exception:
-                    # Olası bir decode hatasında orijinali koru
                     payloads[2] = chunk_data
-                    
-            # DİĞER SLOTLAR: Aynen koru
             else:
                 payloads[c["slot"]] = chunk_data
                 
-        # --- DOSYAYI %100 ORİJİNAL YAPIDA GERİ BİRLEŞTİR ---
+        # Dosyayı orijinal şablonuyla geri birleştir
         new_dir = bytearray()
         current_offset = 10 + (len(chunks) + 1) * 12
         
@@ -141,8 +142,13 @@ def process_rpyc_file(file_bytes, raw_translations):
         return bytes(new_file)
         
     else:
-        # Eski V1 Formatı
+        # Eski V1 Formatı için Protokol Tespiti
         raw_pickle = zlib.decompress(file_bytes)
+        
+        orig_proto = 2
+        if len(raw_pickle) >= 2 and raw_pickle[0] == 0x80:
+            orig_proto = raw_pickle[1]
+            
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         patch_ast(ast_tree, clean_translations)
-        return zlib.compress(pickle.dumps(ast_tree, protocol=2))
+        return zlib.compress(pickle.dumps(ast_tree, protocol=orig_proto))
