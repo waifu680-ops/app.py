@@ -1,9 +1,13 @@
 import struct
 import zlib
-import pickletools
+import pickle
+import sys
+from decompiler import magic, renpycompat
+
+sys.setrecursionlimit(50000)
 
 def unescape_wp_string(s):
-    """WordPress'ten gelen metinleri düzeltir."""
+    """WordPress'ten gelen metinleri formatlar."""
     if not isinstance(s, str): return s
     s = s.replace('\\n', '\n')
     s = s.replace('\\"', '"')
@@ -11,74 +15,87 @@ def unescape_wp_string(s):
     s = s.replace('\\\\', '\\')
     return s.replace('\r', '')
 
-def binary_pickle_patch(pickle_bytes, translations):
-    """
-    Paketi HİÇ AÇMADAN (Pickle.loads kullanmadan) doğrudan makine 
-    kodu üzerinde kelime avı yapar ve metinleri değiştirir.
-    Kusursuz boyut ve çerçeve (Frame) hesaplaması yapar.
-    """
-    ops = list(pickletools.genops(pickle_bytes))
-    edits = []
-    frames = []
+def apply_translation(text, translations):
+    """Sadece eşleşen çevirileri güvenle uygular."""
+    if not isinstance(text, (str, bytes)): return text
+    is_bytes = isinstance(text, bytes)
+    text_str = text.decode('utf-8', 'ignore') if is_bytes else text
     
-    for i, (opcode, arg, pos) in enumerate(ops):
-        # Protocol 4 ve 5'teki boyut çerçevelerini yakala
-        if opcode.name == 'FRAME':
-            frames.append({"pos": pos + 1, "len": arg, "start_data": pos + 9})
+    original_text_str = text_str
+    for k, v in translations.items():
+        if k in text_str:
+            text_str = text_str.replace(k, v)
             
-        # Makine dilindeki metin kodlarını yakala
-        elif opcode.name in ('SHORT_BINUNICODE', 'BINUNICODE', 'UNICODE', 'SHORT_BINSTRING', 'BINSTRING', 'BINBYTES'):
-            if isinstance(arg, str):
-                orig_text = arg
-            else:
-                try:
-                    orig_text = arg.decode('utf-8')
-                except:
-                    continue # UTF-8 değilse atla
-                    
-            new_text = orig_text
-            for k, v in translations.items():
-                if k in new_text:
-                    new_text = new_text.replace(k, v)
-                    
-            # Eğer kelime değiştiyse, boyut kaymasını (Delta) hesapla ve makine koduna enjekte et
-            if new_text != orig_text:
-                new_sdata = new_text.encode('utf-8')
-                end_pos = ops[i+1][2] if i+1 < len(ops) else len(pickle_bytes)
-                
-                if opcode.name in ('SHORT_BINUNICODE', 'SHORT_BINSTRING'):
-                    if len(new_sdata) <= 255:
-                        new_bytes = bytes([pickle_bytes[pos], len(new_sdata)]) + new_sdata
-                    else:
-                        new_op = b'X' if opcode.name == 'SHORT_BINUNICODE' else b'T'
-                        new_bytes = new_op + struct.pack("<I", len(new_sdata)) + new_sdata
-                elif opcode.name in ('BINUNICODE', 'BINSTRING', 'BINBYTES'):
-                    new_bytes = bytes([pickle_bytes[pos]]) + struct.pack("<I", len(new_sdata)) + new_sdata
-                elif opcode.name == 'UNICODE':
-                    new_escaped = new_text.encode('raw_unicode_escape')
-                    new_bytes = b'V' + new_escaped + b'\n'
-                
-                edits.append({
-                    "pos": pos,
-                    "end": end_pos,
-                    "new_bytes": new_bytes,
-                    "delta": len(new_bytes) - (end_pos - pos)
-                })
-                
-    # Hesaplanan değişiklikleri dosyaya sondan başa doğru yaz (Kaymaları önlemek için)
-    data = bytearray(pickle_bytes)
-    for edit in reversed(edits):
-        data[edit["pos"]:edit["end"]] = edit["new_bytes"]
-        if edit["delta"] != 0:
-            for f in frames:
-                if f["start_data"] <= edit["pos"]:
-                    f["len"] += edit["delta"]
-                    data[f["pos"] : f["pos"]+8] = struct.pack("<Q", f["len"])
+    if text_str != original_text_str:
+        return text_str.encode('utf-8') if is_bytes else text_str
+    return text
 
-    return bytes(data)
+def patch_ast(obj, translations, visited=None):
+    """Geliştiricinin ipucuna göre hedeflenmiş kusursuz AST Yamalayıcı."""
+    if visited is None: visited = set()
+    if obj is None or isinstance(obj, (int, float, bool, str, bytes)): return
+    
+    obj_id = id(obj)
+    if obj_id in visited: return
+    visited.add(obj_id)
+
+    if isinstance(obj, (list, tuple)):
+        for item in obj:
+            patch_ast(item, translations, visited)
+            
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            patch_ast(v, translations, visited)
+            
+    elif hasattr(obj, '__dict__'):
+        class_name = type(obj).__name__
+        
+        # --- 1. ADAMIMIZIN VERDİĞİ GİZLİ SINIFLAR ---
+        
+        # Hem normal Say hem de TranslateSay (Çeviri Diyalogları)
+        if class_name in ('Say', 'TranslateSay') and hasattr(obj, 'what'):
+            obj.what = apply_translation(obj.what, translations)
+            
+        # Hem normal Menu hem de TranslateMenu (Çeviri Menüleri)
+        elif class_name in ('Menu', 'TranslateMenu') and hasattr(obj, 'items'):
+            new_items = []
+            for item in obj.items:
+                label = apply_translation(item[0], translations)
+                if len(item) >= 3:
+                    new_items.append((label, item[1], item[2]))
+                else:
+                    new_items.append((label,) + item[1:])
+            obj.items = new_items
+            
+        # Arayüz Çevirileri
+        elif class_name == 'TranslateString':
+            if hasattr(obj, 'new'):
+                obj.new = apply_translation(obj.new, translations)
+                
+        # --- 2. GÜVENLİ DERİN TARAMA (SİNİR UÇLARINA DOKUNMADAN) ---
+        
+        # ASLA VE ASLA değiştirilmemesi gereken, oyunun çökmesine sebep olan Ren'Py sistem değişkenleri!
+        FORBIDDEN_KEYS = {'old', 'language', 'identifier', 'filename', 'name', 'label'}
+        
+        for k, v in obj.__dict__.items():
+            if k in FORBIDDEN_KEYS:
+                continue # Bu anahtarlara dokunursak Unrpyc ve oyun çöker!
+                
+            # Önceden yamadığımız yerleri tekrar yamalama
+            if class_name in ('Say', 'TranslateSay') and k == 'what': continue
+            if class_name in ('Menu', 'TranslateMenu') and k == 'items': continue
+            if class_name == 'TranslateString' and k == 'new': continue
+            
+            # Geri kalan büyük yazıları (Show komutu vb. içindeki) güvenle çevir
+            if isinstance(v, (str, bytes)):
+                text_len = len(v) if isinstance(v, str) else len(v.decode('utf-8', 'ignore'))
+                if text_len >= 2: # Sadece mantıklı uzunluktaki metinlere müdahale et
+                    obj.__dict__[k] = apply_translation(v, translations)
+            else:
+                patch_ast(v, translations, visited)
 
 def process_rpyc_file(file_bytes, raw_translations):
-    """Dosyayı %100 Orijinal formatında tutarak hem Kod hem Kaynak kısımlarını yamalar."""
+    """Tüm parçaları %100 orijinal format ve protokolünde birleştiren Ana Motor."""
     sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {}
     for k in sorted_keys:
@@ -102,13 +119,20 @@ def process_rpyc_file(file_bytes, raw_translations):
             chunk_data = file_bytes[c["start"] : c["start"] + c["length"]]
             
             if c["slot"] == 1:
-                # SLOT 1: İkili Yama (Binary Patch)
                 raw_pickle = zlib.decompress(chunk_data)
-                patched_pickle = binary_pickle_patch(raw_pickle, clean_translations)
-                payloads[1] = zlib.compress(patched_pickle)
+                
+                # Protokolü güvenle kopyala
+                orig_proto = 2
+                if len(raw_pickle) >= 2 and raw_pickle[0] == 0x80:
+                    orig_proto = raw_pickle[1]
+                    
+                ast_tree = renpycompat.pickle_loads(raw_pickle)
+                patch_ast(ast_tree, clean_translations)
+                
+                new_pickle = pickle.dumps(ast_tree, protocol=orig_proto) 
+                payloads[1] = zlib.compress(new_pickle)
                 
             elif c["slot"] == 2:
-                # SLOT 2: Kaynak Kod (Source Code) Yamalaması
                 try:
                     raw_source = zlib.decompress(chunk_data).decode('utf-8')
                     for k, v in clean_translations.items():
@@ -119,7 +143,6 @@ def process_rpyc_file(file_bytes, raw_translations):
             else:
                 payloads[c["slot"]] = chunk_data
                 
-        # Dosyayı orijinal şablonuyla geri birleştir
         new_dir = bytearray()
         current_offset = 10 + (len(chunks) + 1) * 12
         
@@ -128,7 +151,7 @@ def process_rpyc_file(file_bytes, raw_translations):
             new_dir.extend(struct.pack("III", c["slot"], current_offset, len(data)))
             current_offset += len(data)
             
-        new_dir.extend(struct.pack("III", 0, 0, 0)) # Harita Sonu
+        new_dir.extend(struct.pack("III", 0, 0, 0)) 
         
         new_file = bytearray(b"RENPY RPC2")
         new_file.extend(new_dir)
@@ -138,7 +161,10 @@ def process_rpyc_file(file_bytes, raw_translations):
         return bytes(new_file)
         
     else:
-        # Eski V1 Formatı
         raw_pickle = zlib.decompress(file_bytes)
-        patched_pickle = binary_pickle_patch(raw_pickle, clean_translations)
-        return zlib.compress(patched_pickle)
+        orig_proto = 2
+        if len(raw_pickle) >= 2 and raw_pickle[0] == 0x80:
+            orig_proto = raw_pickle[1]
+        ast_tree = renpycompat.pickle_loads(raw_pickle)
+        patch_ast(ast_tree, clean_translations)
+        return zlib.compress(pickle.dumps(ast_tree, protocol=orig_proto))
