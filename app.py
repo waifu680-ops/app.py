@@ -3,12 +3,15 @@ import subprocess
 import uuid
 import shutil
 import base64
+import struct
+import zlib
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# Orijinal Ren'Py Motorunun yolu
-RENPY_SH = os.environ.get('RENPY_DIR', '/renpy-8.1.3-sdk') + '/renpy.sh'
+# Çift Çekirdekli Motor Yolları
+RENPY_7_SH = '/renpy-7.5.3-sdk/renpy.sh'
+RENPY_8_SH = '/renpy-8.1.3-sdk/renpy.sh'
 
 def unescape_wp_string(s):
     if not isinstance(s, str): return s
@@ -17,6 +20,36 @@ def unescape_wp_string(s):
     s = s.replace('\\ ', ' ')
     s = s.replace('\\\\', '\\')
     return s.replace('\r', '')
+
+def detect_engine(file_bytes):
+    """Dosyanın şifreleme protokolüne bakarak Ren'Py 7 mi 8 mi olduğunu anlayan Dedektör"""
+    try:
+        if file_bytes.startswith(b"RENPY RPC2"):
+            position = 10
+            while True:
+                slot, start, length = struct.unpack("III", file_bytes[position:position+12])
+                if slot == 0: break
+                if slot == 1:
+                    chunk = file_bytes[start:start+length]
+                    raw_pickle = zlib.decompress(chunk)
+                    # Pickle V4 veya V5 ise kesinlikle Python 3 (Ren'Py 8) kullanıyordur
+                    if raw_pickle[0] == 0x80 and raw_pickle[1] >= 4:
+                        print("🤖 DEDEKTÖR: Yeni nesil Ren'Py 8 tespit edildi!")
+                        return RENPY_8_SH
+                    else:
+                        print("🤖 DEDEKTÖR: Eski nesil Ren'Py 7 tespit edildi!")
+                        return RENPY_7_SH
+                position += 12
+        else:
+            raw_pickle = zlib.decompress(file_bytes)
+            if raw_pickle[0] == 0x80 and raw_pickle[1] >= 4:
+                print("🤖 DEDEKTÖR: Yeni nesil Ren'Py 8 tespit edildi! (V1 Format)")
+                return RENPY_8_SH
+    except Exception as e:
+        print(f"Dedektör hatası: {e}. Varsayılan olarak Ren'Py 7 kullanılıyor.")
+        
+    print("🤖 DEDEKTÖR: Varsayılan olarak Ren'Py 7 tespit edildi!")
+    return RENPY_7_SH
 
 @app.route('/decompile', methods=['POST'])
 def decompile_rpyc():
@@ -54,6 +87,9 @@ def patch_endpoint():
     original_rpyc_bytes = base64.b64decode(data['filedata'])
     raw_translations = data['translations']
 
+    # Gelen dosyanın hangi motorla derlenmesi gerektiğini otomatik bul!
+    CHOSEN_ENGINE = detect_engine(original_rpyc_bytes)
+
     sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {unescape_wp_string(k): unescape_wp_string(v) for k, v in raw_translations.items() if unescape_wp_string(k).strip()}
 
@@ -82,12 +118,11 @@ def patch_endpoint():
 
         os.remove(rpyc_path)
 
-        # DERLEME AŞAMASI
-        comp_res = subprocess.run([RENPY_SH, proj_dir, 'compile'], capture_output=True, text=True)
+        # Doğru motoru (CHOSEN_ENGINE) kullanarak derleme yap!
+        comp_res = subprocess.run([CHOSEN_ENGINE, proj_dir, 'compile'], capture_output=True, text=True)
 
-        # HATA LOGUNU ZORLA EKRANA BASIYORUZ
         if not os.path.exists(rpyc_path):
-            full_error_msg = f"RenPy Resmi Motoru derleme yapamadı!\n\n--- HATA DETAYI ---\n{comp_res.stdout}\n{comp_res.stderr}"
+            full_error_msg = f"RenPy Resmi Motoru derleme yapamadı!\nKullanılan Motor: {CHOSEN_ENGINE}\n\n--- HATA DETAYI ---\n{comp_res.stdout}\n{comp_res.stderr}"
             print(full_error_msg)
             return jsonify({'error': full_error_msg}), 500
 
