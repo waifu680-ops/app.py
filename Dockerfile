@@ -1,7 +1,7 @@
 # Temel Python imajını alıyoruz
 FROM python:3.9-slim
 
-# Gerekli indirme araçlarını VE Ren'Py'ın ihtiyaç duyduğu grafik kütüphanelerini kuruyoruz
+# Gerekli grafik ve indirme araçlarını kuruyoruz
 RUN apt-get update && apt-get install -y \
     wget \
     bzip2 \
@@ -13,24 +13,29 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# İŞTE BÜYÜK DEĞİŞİM: Oyunun Kendi Sürümü Olan Ren'Py 7.5.3'ü Kuruyoruz!
-RUN wget https://www.renpy.org/dl/7.5.3/renpy-7.5.3-sdk.tar.bz2
-RUN tar -xf renpy-7.5.3-sdk.tar.bz2
-RUN rm renpy-7.5.3-sdk.tar.bz2
-ENV RENPY_DIR=/renpy-7.5.3-sdk
+# 1. MOTOR: Ren'Py 7.5.3 (Python 2 - Eski ve Yaygın Oyunlar İçin)
+RUN wget https://www.renpy.org/dl/7.5.3/renpy-7.5.3-sdk.tar.bz2 && \
+    tar -xf renpy-7.5.3-sdk.tar.bz2 && \
+    rm renpy-7.5.3-sdk.tar.bz2
+
+# 2. MOTOR: Ren'Py 8.1.3 (Python 3 - Yeni Nesil Oyunlar İçin)
+RUN wget https://www.renpy.org/dl/8.1.3/renpy-8.1.3-sdk.tar.bz2 && \
+    tar -xf renpy-8.1.3-sdk.tar.bz2 && \
+    rm renpy-8.1.3-sdk.tar.bz2
 
 # Çalışma klasörümüzü ayarlıyoruz
 WORKDIR /app
 
-# Gerekli Python kütüphanelerini yüklüyoruz
+# Python kütüphanelerini yüklüyoruz
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Senin app.py vb. dosyalarını sunucuya kopyalıyoruz
+# Dosyalarımızı kopyalıyoruz
 COPY . .
 
-# Ren'Py motoruna çalışma izni veriyoruz
-RUN chmod +x $RENPY_DIR/renpy.sh
+# Her iki motora da çalışma izni veriyoruz
+RUN chmod +x /renpy-7.5.3-sdk/renpy.sh
+RUN chmod +x /renpy-8.1.3-sdk/renpy.sh
 
 # Web sunucusu portunu açıyoruz
 EXPOSE 5000
