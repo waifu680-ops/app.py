@@ -13,11 +13,11 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Ren'Py 8.1.3 Resmi SDK'sını indirip sunucuya kuruyoruz
-RUN wget https://www.renpy.org/dl/8.1.3/renpy-8.1.3-sdk.tar.bz2
-RUN tar -xf renpy-8.1.3-sdk.tar.bz2
-RUN rm renpy-8.1.3-sdk.tar.bz2
-ENV RENPY_DIR=/renpy-8.1.3-sdk
+# İŞTE BÜYÜK DEĞİŞİM: Oyunun Kendi Sürümü Olan Ren'Py 7.5.3'ü Kuruyoruz!
+RUN wget https://www.renpy.org/dl/7.5.3/renpy-7.5.3-sdk.tar.bz2
+RUN tar -xf renpy-7.5.3-sdk.tar.bz2
+RUN rm renpy-7.5.3-sdk.tar.bz2
+ENV RENPY_DIR=/renpy-7.5.3-sdk
 
 # Çalışma klasörümüzü ayarlıyoruz
 WORKDIR /app
