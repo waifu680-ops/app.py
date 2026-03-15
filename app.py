@@ -13,6 +13,8 @@ app = Flask(__name__)
 # Çift Çekirdekli Motor Yolları
 RENPY_7_SH = '/renpy-7.5.3-sdk/renpy.sh'
 RENPY_8_SH = '/renpy-8.1.3-sdk/renpy.sh'
+# Decompiler'ın tam adresini (mutlak yol) alıyoruz ki klasör değiştirince kaybolmasın
+UNRPYC_PATH = os.path.abspath('unrpyc.py')
 
 def unescape_wp_string(s):
     if not isinstance(s, str): return s
@@ -34,8 +36,7 @@ def detect_engine(file_bytes):
                     raw_pickle = zlib.decompress(chunk)
                     if raw_pickle[0] == 0x80 and raw_pickle[1] >= 4:
                         return RENPY_8_SH
-                    else:
-                        return RENPY_7_SH
+                    return RENPY_7_SH
                 position += 12
         else:
             raw_pickle = zlib.decompress(file_bytes)
@@ -51,9 +52,8 @@ def decompile_rpyc():
     if not data or 'filedata' not in data:
         return jsonify({"error": "Dosya verisi bulunamadı."}), 400
 
-    # Her okuma işlemi için özel ve yalıtılmış bir klasör açıyoruz
     req_id = str(uuid.uuid4())
-    work_dir = f"temp_decomp_{req_id}"
+    work_dir = os.path.abspath(f"temp_decomp_{req_id}")
     os.makedirs(work_dir, exist_ok=True)
 
     try:
@@ -64,9 +64,10 @@ def decompile_rpyc():
         with open(rpyc_path, 'wb') as f:
             f.write(file_data)
             
-        subprocess.run(['python', 'unrpyc.py', rpyc_path], check=True)
+        # SİHİRLİ DOKUNUŞ: cwd=work_dir ile aracı sadece o klasörün içinde çalışmaya zorluyoruz!
+        subprocess.run(['python', UNRPYC_PATH, filename], cwd=work_dir, check=True)
         
-        # SİHİRLİ KISIM: Dosya içindeki gizli mühür yüzünden ismi neye dönüşürse dönüşsün onu bul!
+        # Artık dosyanın o klasörde oluştuğundan %100 eminiz
         rpy_files = glob.glob(os.path.join(work_dir, "*.rpy"))
         if not rpy_files:
             raise Exception("Decompile işlemi başarısız: .rpy dosyası oluşturulamadı.")
@@ -76,6 +77,8 @@ def decompile_rpyc():
             
         return jsonify({"success": True, "rpy_content": rpy_content})
         
+    except subprocess.CalledProcessError as cpe:
+        return jsonify({"error": f"Decompile aracı çöktü: {str(cpe)}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -95,21 +98,20 @@ def patch_endpoint():
     clean_translations = {unescape_wp_string(k): unescape_wp_string(v) for k, v in raw_translations.items() if unescape_wp_string(k).strip()}
 
     req_id = str(uuid.uuid4())
-    proj_dir = f"temp_project_{req_id}"
+    proj_dir = os.path.abspath(f"temp_project_{req_id}")
     game_dir = os.path.join(proj_dir, "game")
     os.makedirs(game_dir, exist_ok=True)
 
     try:
-        # Rastgele isme takılmamak için burada da kendi adını veriyoruz
         filename = data.get('filename', 'script.rpyc')
         rpyc_path = os.path.join(game_dir, filename)
 
         with open(rpyc_path, 'wb') as f:
             f.write(original_rpyc_bytes)
 
-        subprocess.run(['python', 'unrpyc.py', rpyc_path], check=True)
+        # Aracı yine klasör içine hapsediyoruz
+        subprocess.run(['python', UNRPYC_PATH, filename], cwd=game_dir, check=True)
 
-        # Oluşan dosyayı yine akıllı avcı (glob) ile buluyoruz
         rpy_files = glob.glob(os.path.join(game_dir, "*.rpy"))
         if not rpy_files:
             raise Exception("Decompile işlemi başarısız: .rpy dosyası oluşturulamadı.")
@@ -129,10 +131,9 @@ def patch_endpoint():
 
         comp_res = subprocess.run([CHOSEN_ENGINE, proj_dir, 'compile'], capture_output=True, text=True)
 
-        # Yeni oluşan RPYC dosyasını ismi ne olursa olsun bul!
         rpyc_files = glob.glob(os.path.join(game_dir, "*.rpyc"))
         if not rpyc_files:
-            full_error_msg = f"RenPy Resmi Motoru derleme yapamadı!\nKullanılan Motor: {CHOSEN_ENGINE}\n\n--- HATA DETAYI ---\n{comp_res.stdout}\n{comp_res.stderr}"
+            full_error_msg = f"RenPy Resmi Motoru derleme yapamadı!\nMotor: {CHOSEN_ENGINE}\n\n--- DETAY ---\n{comp_res.stdout}\n{comp_res.stderr}"
             return jsonify({'error': full_error_msg}), 500
 
         with open(rpyc_files[0], 'rb') as f:
@@ -143,6 +144,8 @@ def patch_endpoint():
             'patched_file': base64.b64encode(new_rpyc_bytes).decode('utf-8')
         })
 
+    except subprocess.CalledProcessError as cpe:
+        return jsonify({"error": f"İşlem çöktü: {str(cpe)}"}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
