@@ -5,6 +5,7 @@ import shutil
 import base64
 import struct
 import zlib
+import glob
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -22,7 +23,6 @@ def unescape_wp_string(s):
     return s.replace('\r', '')
 
 def detect_engine(file_bytes):
-    """Dosyanın şifreleme protokolüne bakarak Ren'Py 7 mi 8 mi olduğunu anlayan Dedektör"""
     try:
         if file_bytes.startswith(b"RENPY RPC2"):
             position = 10
@@ -32,23 +32,17 @@ def detect_engine(file_bytes):
                 if slot == 1:
                     chunk = file_bytes[start:start+length]
                     raw_pickle = zlib.decompress(chunk)
-                    # Pickle V4 veya V5 ise kesinlikle Python 3 (Ren'Py 8) kullanıyordur
                     if raw_pickle[0] == 0x80 and raw_pickle[1] >= 4:
-                        print("🤖 DEDEKTÖR: Yeni nesil Ren'Py 8 tespit edildi!")
                         return RENPY_8_SH
                     else:
-                        print("🤖 DEDEKTÖR: Eski nesil Ren'Py 7 tespit edildi!")
                         return RENPY_7_SH
                 position += 12
         else:
             raw_pickle = zlib.decompress(file_bytes)
             if raw_pickle[0] == 0x80 and raw_pickle[1] >= 4:
-                print("🤖 DEDEKTÖR: Yeni nesil Ren'Py 8 tespit edildi! (V1 Format)")
                 return RENPY_8_SH
-    except Exception as e:
-        print(f"Dedektör hatası: {e}. Varsayılan olarak Ren'Py 7 kullanılıyor.")
-        
-    print("🤖 DEDEKTÖR: Varsayılan olarak Ren'Py 7 tespit edildi!")
+    except Exception:
+        pass
     return RENPY_7_SH
 
 @app.route('/decompile', methods=['POST'])
@@ -57,26 +51,36 @@ def decompile_rpyc():
     if not data or 'filedata' not in data:
         return jsonify({"error": "Dosya verisi bulunamadı."}), 400
 
+    # Her okuma işlemi için özel ve yalıtılmış bir klasör açıyoruz
+    req_id = str(uuid.uuid4())
+    work_dir = f"temp_decomp_{req_id}"
+    os.makedirs(work_dir, exist_ok=True)
+
     try:
         file_data = base64.b64decode(data['filedata'])
         filename = data.get('filename', 'temp.rpyc')
-        rpy_filename = filename.replace('.rpyc', '.rpy')
         
-        with open(filename, 'wb') as f:
+        rpyc_path = os.path.join(work_dir, filename)
+        with open(rpyc_path, 'wb') as f:
             f.write(file_data)
             
-        subprocess.run(['python', 'unrpyc.py', filename], check=True)
+        subprocess.run(['python', 'unrpyc.py', rpyc_path], check=True)
         
-        with open(rpy_filename, 'r', encoding='utf-8') as f:
+        # SİHİRLİ KISIM: Dosya içindeki gizli mühür yüzünden ismi neye dönüşürse dönüşsün onu bul!
+        rpy_files = glob.glob(os.path.join(work_dir, "*.rpy"))
+        if not rpy_files:
+            raise Exception("Decompile işlemi başarısız: .rpy dosyası oluşturulamadı.")
+            
+        with open(rpy_files[0], 'r', encoding='utf-8') as f:
             rpy_content = f.read()
             
-        if os.path.exists(filename): os.remove(filename)
-        if os.path.exists(rpy_filename): os.remove(rpy_filename)
-        
         return jsonify({"success": True, "rpy_content": rpy_content})
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
 
 @app.route('/patch', methods=['POST'])
 def patch_endpoint():
@@ -87,10 +91,7 @@ def patch_endpoint():
     original_rpyc_bytes = base64.b64decode(data['filedata'])
     raw_translations = data['translations']
 
-    # Gelen dosyanın hangi motorla derlenmesi gerektiğini otomatik bul!
     CHOSEN_ENGINE = detect_engine(original_rpyc_bytes)
-
-    sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {unescape_wp_string(k): unescape_wp_string(v) for k, v in raw_translations.items() if unescape_wp_string(k).strip()}
 
     req_id = str(uuid.uuid4())
@@ -99,34 +100,42 @@ def patch_endpoint():
     os.makedirs(game_dir, exist_ok=True)
 
     try:
-        rpyc_path = os.path.join(game_dir, "script.rpyc")
-        rpy_path = os.path.join(game_dir, "script.rpy")
+        # Rastgele isme takılmamak için burada da kendi adını veriyoruz
+        filename = data.get('filename', 'script.rpyc')
+        rpyc_path = os.path.join(game_dir, filename)
 
         with open(rpyc_path, 'wb') as f:
             f.write(original_rpyc_bytes)
 
         subprocess.run(['python', 'unrpyc.py', rpyc_path], check=True)
 
-        with open(rpy_path, 'r', encoding='utf-8') as f:
+        # Oluşan dosyayı yine akıllı avcı (glob) ile buluyoruz
+        rpy_files = glob.glob(os.path.join(game_dir, "*.rpy"))
+        if not rpy_files:
+            raise Exception("Decompile işlemi başarısız: .rpy dosyası oluşturulamadı.")
+        
+        actual_rpy_path = rpy_files[0]
+
+        with open(actual_rpy_path, 'r', encoding='utf-8') as f:
             rpy_content = f.read()
 
         for eng, tur in clean_translations.items():
             rpy_content = rpy_content.replace(eng, tur)
 
-        with open(rpy_path, 'w', encoding='utf-8') as f:
+        with open(actual_rpy_path, 'w', encoding='utf-8') as f:
             f.write(rpy_content)
 
         os.remove(rpyc_path)
 
-        # Doğru motoru (CHOSEN_ENGINE) kullanarak derleme yap!
         comp_res = subprocess.run([CHOSEN_ENGINE, proj_dir, 'compile'], capture_output=True, text=True)
 
-        if not os.path.exists(rpyc_path):
+        # Yeni oluşan RPYC dosyasını ismi ne olursa olsun bul!
+        rpyc_files = glob.glob(os.path.join(game_dir, "*.rpyc"))
+        if not rpyc_files:
             full_error_msg = f"RenPy Resmi Motoru derleme yapamadı!\nKullanılan Motor: {CHOSEN_ENGINE}\n\n--- HATA DETAYI ---\n{comp_res.stdout}\n{comp_res.stderr}"
-            print(full_error_msg)
             return jsonify({'error': full_error_msg}), 500
 
-        with open(rpyc_path, 'rb') as f:
+        with open(rpyc_files[0], 'rb') as f:
             new_rpyc_bytes = f.read()
 
         return jsonify({
