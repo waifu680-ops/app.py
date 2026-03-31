@@ -16,18 +16,26 @@ def unescape_wp_string(s):
     return s.replace('\r', '')
 
 def apply_translation(text, translations):
-    """Sadece eşleşen çevirileri güvenle uygular."""
+    """Sadece BİREBİR eşleşen metinleri güvenle çevirir (AST Çökmesini Önler)."""
     if not isinstance(text, (str, bytes)): return text
     is_bytes = isinstance(text, bytes)
     text_str = text.decode('utf-8', 'ignore') if is_bytes else text
     
-    original_text_str = text_str
+    # Sadece birebir eşleşme (Tam Metin Eşleşmesi)
+    # Çünkü substring replace ('her' kelimesinin 'her room'u bozması gibi) AST'yi çökertir.
     for k, v in translations.items():
-        if k in text_str:
-            text_str = text_str.replace(k, v)
+        clean_k = k
+        clean_v = v
+        
+        # Eğer anahtarın başında ve sonunda tırnak varsa (örn: '"her room"') AST'deki tırnaksız haliyle eşleştir
+        if len(k) >= 2 and k[0] in ('"', "'") and k[-1] == k[0]:
+            clean_k = k[1:-1]
+        if len(v) >= 2 and v[0] in ('"', "'") and v[-1] == v[0]:
+            clean_v = v[1:-1]
             
-    if text_str != original_text_str:
-        return text_str.encode('utf-8') if is_bytes else text_str
+        if text_str == clean_k:
+            return clean_v.encode('utf-8') if is_bytes else clean_v
+            
     return text
 
 def patch_ast(obj, translations, visited=None):
@@ -39,7 +47,6 @@ def patch_ast(obj, translations, visited=None):
     if obj_id in visited: return
     visited.add(obj_id)
 
-    # Listelerdeki pasif metinleri doğrudan mutasyona uğrat
     if isinstance(obj, list):
         for i in range(len(obj)):
             if isinstance(obj[i], (str, bytes)):
@@ -51,8 +58,8 @@ def patch_ast(obj, translations, visited=None):
         for item in obj:
             patch_ast(item, translations, visited)
             
-    # Sözlük yapısındaki verileri iterasyon çökmesini engelleyerek yama
     elif isinstance(obj, dict):
+        # Sözlük boyutu değişimi (RuntimeError) hatalarını engellemek için list() kullanılır
         for k, v in list(obj.items()):
             if isinstance(v, (str, bytes)):
                 obj[k] = apply_translation(v, translations)
@@ -81,13 +88,10 @@ def patch_ast(obj, translations, visited=None):
                 obj.new = apply_translation(obj.new, translations)
                 
         # --- 2. GÜVENLİ DERİN TARAMA ---
-        FORBIDDEN_KEYS = {'old', 'language', 'identifier', 'filename', 'name', 'label'}
+        FORBIDDEN_KEYS = {'old', 'language', 'identifier', 'filename', 'name', 'label', 'parameters'}
         
-        # obj.__dict__ üzerinde iterasyon yaparken list() kullanarak Runtime hatalarını engelle
         for k, v in list(obj.__dict__.items()):
-            if k in FORBIDDEN_KEYS:
-                continue
-                
+            if k in FORBIDDEN_KEYS: continue
             if class_name in ('Say', 'TranslateSay') and k == 'what': continue
             if class_name in ('Menu', 'TranslateMenu') and k == 'items': continue
             if class_name == 'TranslateString' and k == 'new': continue
@@ -99,14 +103,34 @@ def patch_ast(obj, translations, visited=None):
             else:
                 patch_ast(v, translations, visited)
 
+def is_safe_to_replace(k):
+    """RenPy script kodlarını ve sistem komutlarını koruyan güçlü filtre."""
+    k_strip = k.strip()
+    if len(k_strip) < 2: return False
+    
+    # Sadece küçük harflerden oluşan kısa komut kelimelerini engelle (at, on, idle, hover vb.)
+    if k_strip.isalpha() and k_strip.islower() and len(k_strip) <= 6:
+        return False
+        
+    forbidden_starts = ["SetVariable", "Jump", "Call", "Show", "Hide", "Play", "Stop", "action ", "at ", "imagebutton", "textbutton"]
+    for f in forbidden_starts:
+        if k_strip.startswith(f):
+            return False
+            
+    return True
+
 def process_rpyc_file(file_bytes, raw_translations):
     """Tüm parçaları %100 orijinal format ve protokolünde birleştiren Ana Motor."""
     sorted_keys = sorted(raw_translations.keys(), key=len, reverse=True)
     clean_translations = {}
     for k in sorted_keys:
         clean_k = unescape_wp_string(k)
-        if clean_k.strip():
-            clean_translations[clean_k] = unescape_wp_string(raw_translations[k])
+        clean_v = unescape_wp_string(raw_translations[k])
+        
+        # Sadece ÇEVRİLMİŞ olanları ve SİSTEM KODU OLMAYANLARI işleme dahil et
+        if clean_k.strip() and clean_k != clean_v:
+            if is_safe_to_replace(clean_k):
+                clean_translations[clean_k] = clean_v
 
     if file_bytes.startswith(b"RENPY RPC2"):
         position = 10
@@ -125,7 +149,6 @@ def process_rpyc_file(file_bytes, raw_translations):
             
             if c["slot"] == 1:
                 raw_pickle = zlib.decompress(chunk_data)
-                
                 orig_proto = 2
                 if len(raw_pickle) >= 2 and raw_pickle[0] == 0x80:
                     orig_proto = raw_pickle[1]
@@ -172,3 +195,4 @@ def process_rpyc_file(file_bytes, raw_translations):
         ast_tree = renpycompat.pickle_loads(raw_pickle)
         patch_ast(ast_tree, clean_translations)
         return zlib.compress(pickle.dumps(ast_tree, protocol=orig_proto))
+        
