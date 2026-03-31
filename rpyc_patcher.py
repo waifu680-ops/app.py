@@ -39,24 +39,33 @@ def patch_ast(obj, translations, visited=None):
     if obj_id in visited: return
     visited.add(obj_id)
 
-    if isinstance(obj, (list, tuple)):
+    # Listelerdeki pasif metinleri doğrudan mutasyona uğrat
+    if isinstance(obj, list):
+        for i in range(len(obj)):
+            if isinstance(obj[i], (str, bytes)):
+                obj[i] = apply_translation(obj[i], translations)
+            else:
+                patch_ast(obj[i], translations, visited)
+                
+    elif isinstance(obj, tuple):
         for item in obj:
             patch_ast(item, translations, visited)
             
+    # Sözlük yapısındaki verileri iterasyon çökmesini engelleyerek yama
     elif isinstance(obj, dict):
-        for k, v in obj.items():
-            patch_ast(v, translations, visited)
-            
+        for k, v in list(obj.items()):
+            if isinstance(v, (str, bytes)):
+                obj[k] = apply_translation(v, translations)
+            else:
+                patch_ast(v, translations, visited)
+                
     elif hasattr(obj, '__dict__'):
         class_name = type(obj).__name__
         
-        # --- 1. ADAMIMIZIN VERDİĞİ GİZLİ SINIFLAR ---
-        
-        # Hem normal Say hem de TranslateSay (Çeviri Diyalogları)
+        # --- 1. GİZLİ SINIFLAR ---
         if class_name in ('Say', 'TranslateSay') and hasattr(obj, 'what'):
             obj.what = apply_translation(obj.what, translations)
             
-        # Hem normal Menu hem de TranslateMenu (Çeviri Menüleri)
         elif class_name in ('Menu', 'TranslateMenu') and hasattr(obj, 'items'):
             new_items = []
             for item in obj.items:
@@ -67,30 +76,26 @@ def patch_ast(obj, translations, visited=None):
                     new_items.append((label,) + item[1:])
             obj.items = new_items
             
-        # Arayüz Çevirileri
         elif class_name == 'TranslateString':
             if hasattr(obj, 'new'):
                 obj.new = apply_translation(obj.new, translations)
                 
-        # --- 2. GÜVENLİ DERİN TARAMA (SİNİR UÇLARINA DOKUNMADAN) ---
-        
-        # ASLA VE ASLA değiştirilmemesi gereken, oyunun çökmesine sebep olan Ren'Py sistem değişkenleri!
+        # --- 2. GÜVENLİ DERİN TARAMA ---
         FORBIDDEN_KEYS = {'old', 'language', 'identifier', 'filename', 'name', 'label'}
         
-        for k, v in obj.__dict__.items():
+        # obj.__dict__ üzerinde iterasyon yaparken list() kullanarak Runtime hatalarını engelle
+        for k, v in list(obj.__dict__.items()):
             if k in FORBIDDEN_KEYS:
-                continue # Bu anahtarlara dokunursak Unrpyc ve oyun çöker!
+                continue
                 
-            # Önceden yamadığımız yerleri tekrar yamalama
             if class_name in ('Say', 'TranslateSay') and k == 'what': continue
             if class_name in ('Menu', 'TranslateMenu') and k == 'items': continue
             if class_name == 'TranslateString' and k == 'new': continue
             
-            # Geri kalan büyük yazıları (Show komutu vb. içindeki) güvenle çevir
             if isinstance(v, (str, bytes)):
                 text_len = len(v) if isinstance(v, str) else len(v.decode('utf-8', 'ignore'))
-                if text_len >= 2: # Sadece mantıklı uzunluktaki metinlere müdahale et
-                    obj.__dict__[k] = apply_translation(v, translations)
+                if text_len >= 2:
+                    setattr(obj, k, apply_translation(v, translations))
             else:
                 patch_ast(v, translations, visited)
 
@@ -121,7 +126,6 @@ def process_rpyc_file(file_bytes, raw_translations):
             if c["slot"] == 1:
                 raw_pickle = zlib.decompress(chunk_data)
                 
-                # Protokolü güvenle kopyala
                 orig_proto = 2
                 if len(raw_pickle) >= 2 and raw_pickle[0] == 0x80:
                     orig_proto = raw_pickle[1]
